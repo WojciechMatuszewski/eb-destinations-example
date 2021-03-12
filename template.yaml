@@ -1,0 +1,150 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Function:
+    Timeout: 5
+
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Auth:
+        Authorizers:
+          GeneralAuth:
+            AuthorizationScopes:
+              - https://my-service.com/scope
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience:
+                - !Ref UserPoolClient
+
+  # === Authorization === #
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: UserPool
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - !Sub "${ResourceServer}/scope"
+      AllowedOAuthFlows:
+        - client_credentials
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      Identifier: https://my-service.com
+      Name: Caller
+      Scopes:
+        - ScopeDescription: Some Description
+          ScopeName: scope
+      UserPoolId: !Ref UserPool
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: ebconnectorswojtek
+      UserPoolId: !Ref UserPool
+
+  # === Authorization End === #
+
+  AuthorizedHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: receiver/
+      Handler: main
+      Runtime: go1.x
+      Events:
+        RootGet:
+          Type: HttpApi
+          Properties:
+            Auth:
+              Authorizer: GeneralAuth
+            Path: /
+            Method: get
+            ApiId: !Ref HttpApi
+
+  CognitoSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: CognitoSecretCF
+      SecretString: '{"CognitoSecret": "placeholder"}'
+
+  # === EB Stuff === #
+  EBConnection:
+    Type: AWS::Events::Connection
+    DependsOn:
+      - CognitoSecret
+    Properties:
+      # The automatically generated name will result in validation error on the resource side.
+      Name: MyCognitoAuthConnection
+      AuthorizationType: OAUTH_CLIENT_CREDENTIALS
+      AuthParameters:
+        OAuthParameters:
+          AuthorizationEndpoint: !Sub "https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token"
+          ClientParameters:
+            ClientID: !Ref UserPoolClient
+            #  Reason: SSM Secure reference is not supported in: [AWS::Events::Connection/Properties/AuthParameters/OAuthParameters/ClientParameters/ClientSecret]
+            ClientSecret: "{{resolve:secretsmanager:CognitoSecretCF:SecretString:CognitoSecret}}"
+          HttpMethod: POST
+          OAuthHttpParameters:
+            HeaderParameters:
+              - IsValueSecret: false
+                Key: Content-Type
+                Value: application/x-www-form-urlencoded
+            BodyParameters:
+              - IsValueSecret: false
+                Key: grant_type
+                Value: client_credentials
+              - IsValueSecret: false
+                Key: client_id
+                Value: !Ref UserPoolClient
+              - IsValueSecret: false
+                Key: scope
+                Value: https://my-service.com/scope
+  EBDestination:
+    Type: AWS::Events::ApiDestination
+    Properties:
+      ConnectionArn: !GetAtt EBConnection.Arn
+      HttpMethod: GET
+      InvocationEndpoint: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  EBRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # TODO: Fix the permissions here
+        - PolicyName: AllowInvokeApiDestination
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: events:InvokeApiDestination
+                Resource: !GetAtt EBDestination.Arn
+
+  EBRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: MySuperDuperRule
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EBDestination.Arn
+          Id: MyApiDestination
+          RoleArn: !GetAtt EBRuleRole.Arn
+
+Outputs:
+  ApiEndpoint:
+    Description: "HTTP API endpoint URL"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
